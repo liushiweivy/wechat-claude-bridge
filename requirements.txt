@@ -1,0 +1,4 @@
+# wxauto 未发布到 PyPI，从仓库内置的本地源码安装（依赖会自动带上）
+./_wxauto-src
+# runner 直接使用（杀 claude 进程树）
+psutil>=5.9
