@@ -5,3 +5,6 @@ config.json
 logs/
 .pytest_cache/
 _wxauto-src/
+# wxauto 运行日志与个人运维脚本（探活/重启/一次性通知）
+@AutomationLog.txt
+tools/_*

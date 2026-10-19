@@ -56,6 +56,17 @@ def test_send_long_text_is_chunked_and_marked():
     assert g.echo.is_echo(fake.sent[0])
 
 
+def test_send_continuation_pieces_carry_prefix():
+    # 探活按首字符归类消息：第 2 段起必须带 ↳，且回声登记与实际发送一致
+    fake = FakeWx([])
+    g = _gateway(fake)
+    g.send("字" * 350)
+    assert len(fake.sent) >= 2
+    assert all(s.startswith("↳ ") for s in fake.sent[1:])
+    for piece in fake.sent:
+        assert g.echo.is_echo(piece)
+
+
 def test_incoming_dataclass():
     m = Incoming("x", "self", "我")
     assert m.content == "x"

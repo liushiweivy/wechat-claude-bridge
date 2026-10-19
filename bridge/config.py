@@ -18,6 +18,7 @@ class Config:
     default_mode: str = "acceptEdits"          # acceptEdits 日常；/sudo 单次 bypassPermissions
     task_timeout_seconds: int = 1800
     max_msg_chars: int = 1500                  # 微信单条消息保守上限
+    max_reply_chars: int = 200                 # AI 最终回复上限（提示+截断双层约束）
     claude_bin: str = "claude"
     extra_args: tuple[str, ...] = field(default_factory=tuple)
 
@@ -35,6 +36,7 @@ class Config:
             default_mode=str(data.get("default_mode", "acceptEdits")),
             task_timeout_seconds=int(data.get("task_timeout_seconds", 1800)),
             max_msg_chars=int(data.get("max_msg_chars", 1500)),
+            max_reply_chars=int(data.get("max_reply_chars", 200)),
             claude_bin=str(data.get("claude_bin", "claude")),
             extra_args=tuple(str(a) for a in data.get("extra_args", [])),
         )
@@ -48,6 +50,8 @@ class Config:
             raise ValueError(f"非法 default_mode: {self.default_mode}")
         if self.max_msg_chars < 200 or self.max_msg_chars > 2000:
             raise ValueError("max_msg_chars 应在 200–2000 之间")
+        if self.max_reply_chars < 100 or self.max_reply_chars > 1000:
+            raise ValueError("max_reply_chars 应在 100–1000 之间")
         ws = Path(self.workspace).resolve()
         for d in self.allowed_dirs:
             p = Path(d).resolve()

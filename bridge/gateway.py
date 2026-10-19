@@ -79,10 +79,16 @@ class WxGateway:
         return out
 
     def send(self, text: str) -> None:
-        """分段发送；每段都记入回环过滤器。"""
+        """分段发送；每段都记入回环过滤器。
+
+        第 2 段起加 ↳ 续段前缀：文件传输助手里无法靠 sender 区分桥与用户，
+        探活（bridge/probe.py）按首字符归类消息，裸续段会被误判成用户消息。
+        mark_sent 记录加前缀后的实际发送内容，回声一致性天然保持。"""
         if self._wx is None:
             raise RuntimeError("gateway 未连接")
         pieces = split_wechat(text, self.max_msg_chars)
+        if len(pieces) > 1:
+            pieces = [pieces[0]] + ["↳ " + p for p in pieces[1:]]
         for piece in pieces:
             self.echo.mark_sent(piece)
             self._wx.SendMsg(piece, who=self.listen_chat)

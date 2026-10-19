@@ -1,0 +1,3 @@
+# cmd 的 goto/call 标签扫描对 LF-only 批处理存在已知不定位失败案例，
+# autostart-visible.bat 有 goto :wechat_up 且是开机自启入口——bat 必须 CRLF。
+*.bat text eol=crlf

@@ -20,14 +20,19 @@ HELP_TEXT = """\
 /sudo 任务　以完全权限执行（可运行命令，谨慎）
 /cancel　取消正在执行的任务
 /status　查看桥状态
+/open　打开电脑上的对应对话窗口（之后任务打进窗口执行）
 /help　再次显示本帮助"""
 
-COMMANDS = {"help", "new", "cd", "sudo", "cancel", "status"}
+COMMANDS = {"help", "new", "cd", "sudo", "cancel", "status", "open", "win"}
+
+# 以这些前缀开头的消息是本机自动通知（如开机公网地址播报），不是用户指令：
+# 桥直接忽略，不回复、不派任务。发送方见 claude-remote-web/tools/notify_public_url.py。
+NOTIFY_PREFIXES = ("🌐",)
 
 
 @dataclass
 class Instruction:
-    kind: str                 # task | help | new | cd | cancel | status | unknown
+    kind: str                 # task | help | new | cd | cancel | status | ignore | unknown
     text: str = ""            # task: 提示词；cd: 目标子目录
     sudo: bool = False
 
@@ -37,6 +42,8 @@ def parse_instruction(raw: str) -> Instruction:
     text = (raw or "").strip()
     if not text:
         return Instruction("unknown")
+    if text.startswith(NOTIFY_PREFIXES):
+        return Instruction("ignore")
     if not text.startswith("/"):
         return Instruction("task", text=text)
 
@@ -49,9 +56,38 @@ def parse_instruction(raw: str) -> Instruction:
         return Instruction("task", text=arg, sudo=True)
     if cmd == "cd":
         return Instruction("cd", text=arg)
+    if cmd in {"open", "win"}:
+        return Instruction("open")
     if cmd in {"help", "new", "cancel", "status"}:
         return Instruction(cmd)
     return Instruction("unknown", text=f"未知命令 /{cmd}，发送 /help 查看用法")
+
+
+# ---------- 回复长度约束 ----------
+# 双层约束：提示层让模型自己写短（保留关键信息），截断层在模型没遵守时硬切兜底。
+REPLY_HINT_TEMPLATE = (
+    "\n\n【回复格式要求】你的最终回复会直接转发到手机微信，必须控制在 {limit} 字以内："
+    "只保留关键信息（结论、成功或失败、必要的文件路径），不写执行过程，"
+    "不用 Markdown 标题和代码块。"
+)
+
+
+def with_reply_hint(prompt: str, limit: int = 200) -> str:
+    """给任务提示词追加"最终回复 ≤limit 字"的格式要求。"""
+    return prompt.rstrip() + REPLY_HINT_TEMPLATE.format(limit=limit)
+
+
+def cap_reply(text: str, limit: int = 200) -> str:
+    """模型没遵守长度要求时的兜底截断：优先句子边界，否则硬切，末尾加省略号。"""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max(window.rfind(p) for p in ("。", "！", "？", "\n", "；",
+                                        ". ", "! ", "? "))
+    if cut < limit // 2:
+        cut = limit
+    return window[:cut].rstrip() + "…"
 
 
 def split_wechat(text: str, limit: int = 1500) -> list[str]:
@@ -124,7 +160,10 @@ class EchoFilter:
 
     @staticmethod
     def _norm(text: str) -> str:
-        # UIA 回报会把 \n 变成 \r\n、偶尔插入空行；折叠所有空白后再比
+        # UIA 回报会把 \n 变成 \r\n、偶尔插入空行；折叠所有空白后再比。
+        # 还会丢 emoji 变体选择符（🖥️ → 🖥），两边统一剥掉再比（2026-10-18
+        # /open 的 🖥️ 消息因此漏判成任务）。
+        text = text.replace("️", "").replace("︎", "")
         return " ".join(text.split())
 
     def mark_sent(self, text: str) -> None:
@@ -138,7 +177,11 @@ class EchoFilter:
             sent = self._norm(text)
             exact = content == sent and age <= self.exact_window_seconds
             prefix = age <= self.window_seconds and content.startswith(sent[:80])
-            if exact or prefix:
+            # UIA 偶尔把桥连续发的多条合成一条回报（2026-10-18 /open 三连消息
+            # 合成一条被当成任务）：已发消息作为子串出现在其中也算回声。
+            merged = (age <= self.window_seconds and len(sent) >= 12
+                      and sent in content)
+            if exact or prefix or merged:
                 del self._sent[i]         # 消费即弹出
                 return True
         return False
@@ -229,6 +272,36 @@ def transcript_path(cwd: str | Path, session_id: str,
     return base / ".claude" / "projects" / slug / f"{session_id}.jsonl"
 
 
+def find_newer_session(cwd: str | Path, since_ts: float,
+                       home: Path | None = None,
+                       exclude: frozenset[str] = frozenset()) -> str:
+    """找 cwd 对应 projects 目录里**创建时间**晚于 since_ts 的最新 transcript。
+
+    /open 开了新 CC 窗口后，用户在窗口里发出第一条消息时 CLI 才落盘 jsonl；
+    桥靠这个函数把那个新会话认领成自己的 session_id。找不到返回 ""。
+
+    必须用创建时间（Windows 上 st_ctime）而非 mtime：老会话被别的窗口
+    碰一下 mtime 就更新，会被误认领（2026-10-18 实测 759d5e12 被误领）。
+    exclude：桥自己任务产生的 session_id 必须排除，否则 /open 后的头一条
+    微信任务会被误认成"窗口会话"（2026-10-18 实测认领错）。"""
+    directory = transcript_path(cwd, "placeholder", home=home).parent
+    best, best_ctime = "", since_ts
+    try:
+        files = list(directory.glob("*.jsonl"))
+    except OSError:
+        return ""
+    for f in files:
+        if f.stem in exclude:
+            continue
+        try:
+            ctime = f.stat().st_ctime
+        except OSError:
+            continue
+        if ctime > best_ctime:
+            best, best_ctime = f.stem, ctime
+    return best
+
+
 def last_assistant_text(path: Path) -> str:
     """读 transcript，返回最后一条含非空 text 块的 assistant 消息文本。
 
@@ -266,3 +339,17 @@ def clean_stderr(stderr: str) -> str:
     kept = [ln for ln in (stderr or "").splitlines()
             if not any(tag in ln for tag in _BENIGN_STDERR_TAGS)]
     return "\n".join(kept).strip()
+
+
+# ---------- 子进程环境 ----------
+def clean_child_env() -> dict[str, str]:
+    """剥掉所有 CLAUDE* 环境变量的子进程环境。
+
+    桥若是从某个 claude 会话终端里（间接）启动的，会继承
+    CLAUDE_CODE_CHILD_SESSION=1 等标记；带着它起 claude（窗口或 -p）
+    会被当成子会话：窗口屏幕警告「Transcript saving is off — inherited
+    CLAUDE_CODE_CHILD_SESSION marker」，不写 transcript、不注册会话，
+    认领/取结果全断（2026-10-18 窗口 2188 实测定位）。"""
+    import os
+    return {k: v for k, v in os.environ.items()
+            if not k.upper().startswith("CLAUDE")}

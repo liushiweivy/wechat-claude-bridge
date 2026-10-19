@@ -1,5 +1,5 @@
 # Install logon-autostart shortcuts (no admin needed):
-#  - WeChat Claude Bridge : hidden VBS launcher (grace + wait for WeChat)
+#  - WeChat Claude Bridge : visible cmd window (grace + wait for WeChat + retry)
 #  - Claude Console       : visible cmd window running `claude`
 # WeChat itself already autostarts via HKCU\Run ("Wechat" = WeChat.exe -autorun).
 $startup = [Environment]::GetFolderPath("Startup")
@@ -7,10 +7,11 @@ $shell = New-Object -ComObject WScript.Shell
 
 $bridge = Join-Path $startup "WeChat Claude Bridge.lnk"
 $s = $shell.CreateShortcut($bridge)
-$s.TargetPath = "wscript.exe"
-$s.Arguments = '"E:\1workspace\wechat-claude-bridge\tools\autostart.vbs"'
+$s.TargetPath = "$env:SystemRoot\System32\cmd.exe"
+$s.Arguments = '/k "E:\1workspace\wechat-claude-bridge\tools\autostart-visible.bat"'
 $s.WorkingDirectory = "E:\1workspace\wechat-claude-bridge"
-$s.Description = "WeChat-Claude bridge hidden autostart"
+$s.WindowStyle = 1
+$s.Description = "WeChat-Claude bridge visible autostart"
 $s.Save()
 
 $claude = Join-Path $startup "Claude Console.lnk"

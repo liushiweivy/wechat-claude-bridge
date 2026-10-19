@@ -8,13 +8,16 @@ import pytest
 from bridge.core import (
     EchoFilter,
     build_claude_args,
+    cap_reply,
     clean_stderr,
+    find_newer_session,
     last_assistant_text,
     parse_instruction,
     parse_stream_line,
     resolve_cd,
     split_wechat,
     transcript_path,
+    with_reply_hint,
 )
 
 
@@ -42,6 +45,12 @@ def test_sudo_sets_flag_and_keeps_text():
 
 def test_sudo_without_arg_is_unknown():
     assert parse_instruction("  /sudo  ").kind == "unknown"
+
+
+def test_notify_prefix_is_ignored():
+    # 本机自动通知（如开机公网地址播报）不是用户指令，桥必须忽略
+    ins = parse_instruction("🌐 会话台公网地址\nhttp://x.cpolar.top/?token=1")
+    assert ins.kind == "ignore"
 
 
 def test_unknown_command_and_blank():
@@ -255,3 +264,119 @@ def test_clean_stderr_strips_unrecognized_model_warning():
 def test_clean_stderr_keeps_catalog_error():
     raw = '"ark-code-latest" isn\'t described by this version\'s model catalog'
     assert clean_stderr(raw) == raw
+
+
+# ---------- 回复长度约束 ----------
+def test_with_reply_hint_appends_limit_and_keeps_prompt():
+    out = with_reply_hint("帮我看看项目结构", 200)
+    assert out.startswith("帮我看看项目结构")
+    assert "200 字以内" in out and "关键信息" in out
+
+
+def test_cap_reply_short_text_unchanged():
+    assert cap_reply("完成了。", 200) == "完成了。"
+
+
+def test_cap_reply_cuts_at_sentence_boundary():
+    text = "。".join(["句子"] * 100) + "。"
+    out = cap_reply(text, 200)
+    assert out.endswith("…")
+    assert len(out) <= 201
+    assert "。" in out          # 优先在句号处断，不是半路硬切
+
+
+def test_cap_reply_hard_cut_without_punctuation():
+    out = cap_reply("好" * 500, 200)
+    assert out == "好" * 200 + "…"
+
+
+# ---------- /open 与窗口会话认领 ----------
+def test_parse_open_and_win_alias():
+    assert parse_instruction("/open").kind == "open"
+    assert parse_instruction("/win").kind == "open"
+    assert parse_instruction("/OPEN").kind == "open"
+
+
+def _set_creation_time(path: Path, ts: float) -> None:
+    """Windows 专用：SetFileTime 改文件创建时间（os.utime 只改 mtime/atime）。"""
+    import ctypes
+    ft_val = int((ts + 11644473600) * 10_000_000)   # epoch → FILETIME(100ns)
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                    ("dwHighDateTime", ctypes.c_uint32)]
+
+    ft = FILETIME(ft_val & 0xFFFFFFFF, ft_val >> 32)
+    handle = ctypes.windll.kernel32.CreateFileW(
+        str(path), 0x100, 7, None, 3, 0, None)   # FILE_WRITE_ATTRIBUTES
+    assert handle not in (0, -1)
+    try:
+        assert ctypes.windll.kernel32.SetFileTime(handle, ctypes.byref(ft),
+                                                  None, None)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def test_find_newer_session_picks_only_newer(tmp_path: Path):
+    home = tmp_path
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    directory = transcript_path(cwd, "x", home=home).parent
+    directory.mkdir(parents=True)
+    old = directory / "old-sess.jsonl"
+    old.write_text("{}", encoding="utf-8")
+    _set_creation_time(old, time.time() - 100)
+    assert find_newer_session(cwd, time.time() - 50, home=home) == ""
+    new = directory / "new-sess.jsonl"
+    new.write_text("{}", encoding="utf-8")
+    assert find_newer_session(cwd, time.time() - 50, home=home) == "new-sess"
+
+
+def test_find_newer_session_ignores_touched_old_file(tmp_path: Path):
+    """回归 2026-10-18 误认领：老会话 jsonl 被碰过（mtime 新、创建时间旧）
+    不得被认领——认领看的是创建时间。"""
+    home = tmp_path
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    directory = transcript_path(cwd, "x", home=home).parent
+    directory.mkdir(parents=True)
+    old = directory / "touched-sess.jsonl"
+    old.write_text("{}", encoding="utf-8")
+    _set_creation_time(old, time.time() - 3600)   # 创建很早
+    old.write_text("{}\n", encoding="utf-8")       # 但刚被碰过（mtime 新）
+    assert find_newer_session(cwd, time.time() - 50, home=home) == ""
+
+
+def test_find_newer_session_excludes_own(tmp_path: Path):
+    home = tmp_path
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    directory = transcript_path(cwd, "x", home=home).parent
+    directory.mkdir(parents=True)
+    own = directory / "own-sess.jsonl"
+    own.write_text("{}", encoding="utf-8")
+    # 唯一的"新"文件被排除后应返回空，而不是误认领自己的任务会话
+    assert find_newer_session(cwd, time.time() - 50, home=home,
+                              exclude=frozenset({"own-sess"})) == ""
+
+
+# ---------- EchoFilter：UIA 变体 ----------
+def test_echo_ignores_emoji_variation_selector():
+    ef = EchoFilter()
+    ef.mark_sent("🖥️ 已在电脑上打开新的 CC 窗口\n在窗口里发出第一条消息后请等待")
+    # UIA 回报丢掉 ️（变体选择符）
+    assert ef.is_echo("🖥 已在电脑上打开新的 CC 窗口\n在窗口里发出第一条消息后请等待")
+
+
+def test_echo_merged_multiple_sent_messages():
+    ef = EchoFilter()
+    ef.mark_sent("⏳ 已开工【完全权限(全盘)】\n做点什么看看")
+    ef.mark_sent("🔗 已认领电脑窗口的对话（会话 720681cd…）")
+    # UIA 把桥连续发的多条合成一条回报（夹带杂散 n 前缀）
+    assert ef.is_echo("n⏳ 已开工【完全权限(全盘)】 做点什么看看 n🔗 已认领电脑窗口的对话（会话 720681cd…）")
+
+
+def test_echo_does_not_eat_real_user_message():
+    ef = EchoFilter()
+    ef.mark_sent("⏳ 已开工【完全权限(全盘)】\n做点什么看看")
+    assert not ef.is_echo("n你好")

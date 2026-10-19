@@ -66,3 +66,15 @@ def test_load_config_roundtrip(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg_path)
     cfg = load_config()
     assert cfg.poll_seconds == 3
+
+
+def test_max_reply_chars_default_and_range(tmp_path: Path):
+    cfg = Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),))
+    assert cfg.max_reply_chars == 200
+    cfg.validate()
+    with pytest.raises(ValueError, match="max_reply_chars"):
+        Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),),
+               max_reply_chars=10).validate()
+    with pytest.raises(ValueError, match="max_reply_chars"):
+        Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),),
+               max_reply_chars=5000).validate()
