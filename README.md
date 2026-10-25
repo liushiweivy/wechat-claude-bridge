@@ -29,6 +29,10 @@
 
 1. **PC 微信必须是 3.9.x**（本机实测 3.9.10.27）。wxauto 基于 UIAutomation，
    **不支持微信 4.0，切勿升级**。
+   微信 4.x 备用后端已就绪：`config.json` 设 `"gateway_backend": "v4"` 切到
+   wxauto4（`bridge/gateway4.py`，接口与 V3 完全一致）。切换步骤、tools/
+   适配缺口与回滚注意见 [docs/wxauto4-migration.md](docs/wxauto4-migration.md)。
+   网上"微信 4.x 破解版"是魔改客户端，盗号/封号风险，勿用。
 2. Python 3.12（项目自带 `.venv`）。
 3. 本机已安装并登录 Claude Code CLI（`claude --version` 可用）。
 4. wxauto 源码已内置在 `_wxauto-src/`（该库未发布 PyPI）。
@@ -90,24 +94,47 @@
 
 主循环只在 `pull()` 抛异常时重连；COM/UIA 调用**挂死不返回**时桥会"看着
 连着、其实聋了"（2026-10-19 晨实测：进程在、消息有来无回 10 小时）。
-同进程内无解（进程级 COM 状态损坏），故探活是**独立外部进程**：
+同进程内无解（进程级 COM 状态损坏），故探活是**独立外部进程**。
+
+2026-10-21 起部署形态为 **Windows 任务计划每小时拉起一次的短命巡检**
+（任务名 `WxBridgeHourlyProbe`，`tools/install_hourly_task.ps1` 安装）。
+此前常驻 pythonw 曾无声蒸发、连同守护 bat 一起死透数小时无人拉起；系统任务
+计划服务不会死，由它当"监控者的监控者"：
 
 ```
-tools/bridge_probe.py（pythonw 常驻，logs/probe.log）
-  每 15s 只读「文件传输助手」尾部 30 条（GetAllMessage，不消费桥的监听队列）
-  → 按首字符归类（桥回复全部带 emoji 前缀，⏳ 忙回复也算响应；🌐/sys/time 忽略）
-  → 连续 ≥2 条用户消息无桥回复、且最早一条 first-seen ≥180s → 判定聋
-  → 桥进程在：杀进程树（autostart bat ~20s 拉起新桥）
-  → 桥与守护 bat 都不在（30 次重试烧完）：自己拉回 autostart-run.bat
-  → 处置前发 🔧 微信提醒（🔧 在桥前缀表内，不会自激杀循环）
+任务计划每小时 :11 调 .venv\Scripts\pythonw.exe tools\bridge_probe.py（跑完即退）
+  Global mutex 单例（任务 IgnoreNew + 互斥量双保险，8 分钟硬超时兜底）
+  → 读 logs/probe_state.json（上一轮 first-seen/冷却，跨进程墙钟计时）
+  → 桥与守护 bat 都不在：拉回 autostart-run.bat，写空基线本轮结束（给新桥完整宽限）
+  → 桥在：只读「文件传输助手」尾部 30 条（GetAllMessage，不消费桥的监听队列）
+    按首字符归类（桥回复全部带 emoji 前缀，⏳ 忙回复也算响应；🌐/sys/time 忽略）
+    连续 ≥2 条用户消息无桥回复：首轮先登记，同一轮内等 200s 二次确认；
+    跨小时的旧块直接按 state 里的 first-seen 计龄
+  → 最早一条 first-seen ≥180s → 判定聋
+    桥进程在：杀进程树（守护 bat ~20s 拉起新桥）；桥和 bat 都没了：自己拉 bat
+    处置前发 🔧 微信提醒（🔧 在桥前缀表内，不会自激杀循环）
+  → first-seen/冷却原子写回 state，进程退出
 ```
 
-- 判定阈值环境变量：`BRIDGE_PROBE_MIN_UNANSWERED`(2)、`BRIDGE_PROBE_MIN_AGE`(180)、
-  `BRIDGE_PROBE_POLL`(15)；`BRIDGE_PROBE_DRY_RUN=1` 或 `--dry-run` 只记不杀。
-- 探活由两个 autostart bat 在循环内顺带保活（单例检查，不重复起）；不单独占自启入口。
-- 探活只杀不拉桥（双拉会双回复）；手动 `start.bat` 场景被杀后靠 🔧 提醒人工重跑。
+- 新桥宽限：巡检发现桥进程年龄 < 200s 时丢弃 state 里的历史 first-seen
+  （那些时间戳属于上一代桥），防巡检落在 🤖 上线横幅前的窄窗里把恢复中的
+  桥首轮判死。任务计划 ExecutionTimeLimit 杀的是整棵进程树（venv 双层
+  重定向器父子进程均会终止，2026-10-21 实测），不会留下攥着 mutex 的孤儿。
+- 守护 bat 识别按 `autostart-(run|visible).bat` 基名 + 项目归属（cmdline
+  含项目目录名，或进程 cwd 为本项目根）。相对路径拉起且 cwd 读不到（更高
+  权限 shell）时保守等待、绝不重复拉 bat，避免双桥抢同一会话。
+- `logs/probe_state.json` 含最近未回复消息的原文 key（与 probe.log 同在
+  gitignored 的 `logs/`，单机单用户）；介意可删，删掉只退化为全新基线。
+- 阈值环境变量：`BRIDGE_PROBE_MIN_UNANSWERED`(2)、`BRIDGE_PROBE_MIN_AGE`(180)；
+  `BRIDGE_PROBE_DRY_RUN=1` 或 `--dry-run` 只记不杀；`--watch` 是人工排障用的
+  常驻 15s 循环（纯内存状态，与任务实例 mutex 互斥）。
+- 最坏恢复时间 ≈ 等下一轮巡检（≤1h）+ 200s 确认 + 20s 重启；微信没登录时巡检
+  退出码 1，任务计划按 2 分钟间隔重试 2 次，下一小时仍会再来。
 - 配套约束：桥所有回复必须带 emoji 前缀（探活按此归类），分段回复的续段
   由 gateway 自动加 `↳ `；新增 `_safe_send` 调用点时保持该约定。
+- 安装/卸载（无需管理员，仅当前交互用户）：
+  `powershell -ExecutionPolicy Bypass -File tools/install_hourly_task.ps1`
+  （卸载加 `-Uninstall`）。
 
 ## 已知限制
 

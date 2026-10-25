@@ -35,16 +35,12 @@ for /l %%i in (1,1,24) do (
 echo [autostart] WeChat.exe not seen after 8 min, starting bridge anyway.
 :wechat_up
 
+rem Deafness probe is launched hourly by Task Scheduler (WxBridgeHourlyProbe),
+rem not from this bat: a resident pythonw probe could die silently with nobody
+rem left to restart it (2026-10-21 three-process outage).
 for /l %%i in (1,1,30) do (
   echo [!date! !time!] autostart attempt %%i
   echo [!date! !time!] autostart attempt %%i >> logs\autostart.log
-  powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | Where-Object { $_.CommandLine -like '*bridge_probe.py*' }) { exit 1 } else { exit 0 }"
-  if errorlevel 1 (
-    echo [!date! !time!] probe already running >> logs\autostart.log
-  ) else (
-    echo [!date! !time!] starting probe >> logs\autostart.log
-    start "" .venv\Scripts\pythonw.exe tools\bridge_probe.py
-  )
   .venv\Scripts\python.exe -u -m bridge
   echo [!date! !time!] bridge exited, retry in 20s
   echo [!date! !time!] bridge exited, retry in 20s >> logs\autostart.log

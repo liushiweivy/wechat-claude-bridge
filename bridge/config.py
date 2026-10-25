@@ -21,6 +21,7 @@ class Config:
     max_reply_chars: int = 200                 # AI 最终回复上限（提示+截断双层约束）
     claude_bin: str = "claude"
     extra_args: tuple[str, ...] = field(default_factory=tuple)
+    gateway_backend: str = "v3"                # v3=wxauto/微信3.9；v4=wxauto4/微信4.x
 
     @staticmethod
     def from_dict(data: dict) -> "Config":
@@ -39,6 +40,7 @@ class Config:
             max_reply_chars=int(data.get("max_reply_chars", 200)),
             claude_bin=str(data.get("claude_bin", "claude")),
             extra_args=tuple(str(a) for a in data.get("extra_args", [])),
+            gateway_backend=str(data.get("gateway_backend", "v3")),
         )
         cfg.validate()
         return cfg
@@ -48,6 +50,8 @@ class Config:
             raise ValueError("poll_seconds 不能小于 1（过于频繁会拖慢微信窗口）")
         if self.default_mode not in {"default", "acceptEdits", "plan", "bypassPermissions"}:
             raise ValueError(f"非法 default_mode: {self.default_mode}")
+        if self.gateway_backend not in {"v3", "v4"}:
+            raise ValueError(f"非法 gateway_backend: {self.gateway_backend}（只支持 v3/v4）")
         if self.max_msg_chars < 200 or self.max_msg_chars > 2000:
             raise ValueError("max_msg_chars 应在 200–2000 之间")
         if self.max_reply_chars < 100 or self.max_reply_chars > 1000:

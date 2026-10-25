@@ -2,6 +2,9 @@
 rem WeChat-Claude Bridge - hidden autostart launcher with retry loop.
 rem Pure ASCII only. python -m bridge stays resident while WeChat is up;
 rem if it exits (WeChat not logged in yet, disconnect) we retry for ~10 min.
+rem The hourly deafness probe is launched by Task Scheduler (WxBridgeHourlyProbe),
+rem not by this bat: a resident pythonw probe could die silently and the bat
+rem could be closed, leaving nobody to watch the watcher (2026-10-21 outage).
 rem delayedexpansion: %date%/%time% inside a for block expand ONCE at parse
 rem time (all 30 retries would log the same frozen timestamp); use !date! !time!.
 setlocal enabledelayedexpansion
@@ -11,13 +14,6 @@ start "" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File
 
 for /l %%i in (1,1,30) do (
   echo [!date! !time!] autostart attempt %%i >> logs\autostart.log
-  powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | Where-Object { $_.CommandLine -like '*bridge_probe.py*' }) { exit 1 } else { exit 0 }"
-  if errorlevel 1 (
-    echo [!date! !time!] probe already running >> logs\autostart.log
-  ) else (
-    echo [!date! !time!] starting probe >> logs\autostart.log
-    start "" .venv\Scripts\pythonw.exe tools\bridge_probe.py
-  )
   .venv\Scripts\python.exe -m bridge >> logs\autostart.log 2>&1
   echo [!date! !time!] bridge exited, retry in 20s >> logs\autostart.log
   rem timeout.exe exits instantly when stdin is not a console; use ping instead.

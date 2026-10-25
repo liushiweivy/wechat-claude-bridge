@@ -17,6 +17,7 @@ from .core import (HELP_TEXT, cap_reply, clean_child_env, find_newer_session,
                    parse_instruction, resolve_cd, transcript_path,
                    with_reply_hint)
 from .gateway import WxGateway
+from .gateway4 import WxGatewayV4
 from .runner import ClaudeRunner, TaskStatus
 from .winconsole import find_session_id
 from .winrunner import WindowRunner
@@ -114,7 +115,8 @@ class BridgeApp:
         self.cfg = cfg
         self.cwd = Path(cfg.workspace).resolve()
         self.session_id = ""
-        self.gw = WxGateway(cfg.listen_chat, cfg.max_msg_chars)
+        gw_cls = WxGatewayV4 if cfg.gateway_backend == "v4" else WxGateway
+        self.gw = gw_cls(cfg.listen_chat, cfg.max_msg_chars)
         self.runner = ClaudeRunner(
             cfg.claude_bin, cfg.default_mode, cfg.task_timeout_seconds, cfg.extra_args
         )

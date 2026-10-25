@@ -10,5 +10,6 @@
   "max_msg_chars": 1500,
   "claude_bin": "claude",
   "extra_args": [],
-  "max_reply_chars": 200
+  "max_reply_chars": 200,
+  "gateway_backend": "v3"
 }

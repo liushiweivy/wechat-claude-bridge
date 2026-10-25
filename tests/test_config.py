@@ -68,6 +68,16 @@ def test_load_config_roundtrip(tmp_path: Path, monkeypatch):
     assert cfg.poll_seconds == 3
 
 
+def test_gateway_backend_default_v3_and_whitelist(tmp_path: Path):
+    cfg = Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),))
+    assert cfg.gateway_backend == "v3"
+    Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),),
+           gateway_backend="v4").validate()
+    with pytest.raises(ValueError, match="非法 gateway_backend"):
+        Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),),
+               gateway_backend="v9").validate()
+
+
 def test_max_reply_chars_default_and_range(tmp_path: Path):
     cfg = Config(workspace=str(tmp_path), allowed_dirs=(str(tmp_path),))
     assert cfg.max_reply_chars == 200

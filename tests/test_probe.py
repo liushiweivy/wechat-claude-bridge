@@ -4,8 +4,9 @@ from types import SimpleNamespace
 import pytest
 
 from bridge.probe import (BRIDGE_PREFIXES, DeafnessDetector, MsgView,
-                          classify, find_autostart_pids, find_bridge_pids,
-                          normalize)
+                          classify, find_ambiguous_autostart_pids,
+                          find_autostart_pids, find_bridge_pids, normalize,
+                          recovery_action)
 
 
 def msg(content: str, msg_type: str = "self") -> MsgView:
@@ -159,6 +160,125 @@ def test_cooldown_after_reset():
     assert d.observe(tail).deaf
 
 
+# ---------- 跨进程状态持久化（每小时短命巡检之间共享 first-seen） ----------
+
+def test_state_roundtrip_keeps_first_seen():
+    clock = FakeClock(10_000.0)
+    d1 = _detector(clock)
+    tail = [msg("任务A"), msg("任务B")]
+    assert not d1.observe(tail).deaf          # 首轮只登记基线
+    state = d1.export_state()
+    assert set(state["first_seen"].keys()) == {m.key for m in tail}
+    assert state["cooldown_until"] == 0.0
+
+    # 一小时后（任务计划拉起的全新 Python 进程）载入旧 state，同块仍无回复 → 判聋
+    clock.advance(3600)
+    d2 = _detector(clock, state=state)
+    v = d2.observe(tail)
+    assert v.deaf and v.unanswered == 2
+
+
+def test_exported_state_drops_keys_outside_current_block():
+    """被桥回复断块的旧消息不带进新进程：否则用户按桥提示重发同文会命中
+    陈旧时间戳、age 虚高、绕过 180s 宽限误杀恢复中的桥（同 HIGH 回归）。"""
+    d1 = _detector(FakeClock())
+    d1.observe([msg("任务A")])
+    assert not d1.observe([msg("任务A"), msg("✅ 完成")]).deaf
+    assert d1.export_state()["first_seen"] == {}
+
+
+def test_cooldown_persists_across_instances():
+    """reset 后的 300s 冷却也跨进程：否则新进程首轮就把刚重启的桥误判。"""
+    clock = FakeClock()
+    d1 = _detector(clock)
+    tail = [msg("任务A"), msg("任务B")]
+    d1.observe(tail)
+    clock.advance(200)
+    assert d1.observe(tail).deaf
+    d1.reset()
+
+    d2 = _detector(clock, state=d1.export_state())
+    assert not d2.observe(tail).deaf          # 冷却期内不判
+    clock.advance(300)
+    assert not d2.observe(tail).deaf          # 冷却结束、基线已清，重新累计
+    clock.advance(180)
+    assert d2.observe(tail).deaf
+
+
+def test_forget_first_seen_clears_history_but_keeps_cooldown():
+    """桥进程确认刚启动时：state 里的陈旧 first-seen 属于上一代桥，必须丢弃；
+    但冷却时间戳保留（reset 后的冷却仍要跨进程生效）。"""
+    clock = FakeClock()
+    d1 = _detector(clock)
+    d1.observe([msg("任务A"), msg("任务B")])
+    clock.advance(200)
+    d1.observe([msg("任务A"), msg("任务B")])
+    d1.reset()
+    cooldown_until = d1.export_state()["cooldown_until"]
+
+    clock.advance(301)                               # 先走出冷却期
+    d2 = _detector(clock, state=d1.export_state())
+    d2.observe([msg("任务A"), msg("任务B")])
+    assert d2.export_state()["first_seen"]          # 又登记了新块
+    d2.forget_first_seen()
+    state = d2.export_state()
+    assert state["first_seen"] == {}
+    assert state["cooldown_until"] == cooldown_until
+
+
+@pytest.mark.parametrize("bad", [
+    "x", 42, ["no"], {"first_seen": "x"},
+    {"first_seen": {"k": "late"}}, {"first_seen": {123: 1.0}},
+    {"cooldown_until": "soon"}, {"first_seen": None, "cooldown_until": None},
+])
+def test_broken_state_falls_back_to_fresh_baseline(bad):
+    d = _detector(FakeClock(), state=bad)
+    state = d.export_state()
+    assert state["first_seen"] == {}
+    assert state["cooldown_until"] == 0.0
+
+
+def test_missing_and_empty_state_is_fresh_baseline():
+    assert _detector(FakeClock()).export_state()["first_seen"] == {}
+    assert _detector(FakeClock(), state={}).export_state()["first_seen"] == {}
+
+
+# ---------- 进程巡检决策（桥 / bat 存活组合） ----------
+
+def test_recovery_action_alive_when_bridge_running():
+    assert recovery_action(PROCS, self_pid=100) == "alive"
+
+
+def test_recovery_waits_when_bat_alive_but_bridge_missing():
+    procs = [p for p in PROCS if p[0] != 200]   # 桥没了，bat 还在重试
+    assert recovery_action(procs, self_pid=100) == "wait_bat"
+
+
+def test_recovery_relaunches_when_bridge_and_bat_both_gone():
+    procs = [p for p in PROCS if p[0] not in (200, 400)]
+    assert recovery_action(procs, self_pid=100) == "relaunch"
+
+
+def test_recovery_waits_when_bat_match_has_unreadable_cwd():
+    """相对路径守护 bat 由更高权限 shell 拉起、探活读不到 cwd(None)：
+    基名命中但归属未知。保守 wait_bat（最坏晚一轮恢复），绝不 relaunch
+    拉第二个 bat 造成双桥抢会话（2026-10-21 二轮复审 MEDIUM）。"""
+    ambiguous = [(700, "cmd.exe", r"cmd /c tools\autostart-run.bat", None)]
+    assert recovery_action(ambiguous, self_pid=100) == "wait_bat"
+    assert find_autostart_pids(ambiguous, self_pid=100) == []
+    assert find_ambiguous_autostart_pids(ambiguous, self_pid=100) == [700]
+
+
+def test_ambiguous_empty_when_sibling_cwd_readable():
+    """cwd 能读到且是姊妹项目：归属已知不是我们，不算 ambiguous，
+    桥真死时必须正常 relaunch（不能被姊妹 bat 永久挡住）。"""
+    procs = [(701, "cmd.exe", r"cmd /c tools\autostart-run.bat",
+              r"E:\1workspace\claude-remote-web")]
+    assert find_ambiguous_autostart_pids(procs, self_pid=100) == []
+    assert find_autostart_pids(procs, self_pid=100) == []
+    assert recovery_action(procs, self_pid=100) == "relaunch"
+
+
 # ---------- 杀目标选择 ----------
 
 PROCS = [
@@ -181,3 +301,40 @@ def test_find_bridge_pids_excludes_self_pid():
 
 def test_find_autostart_pids_selects_only_bridge_bat():
     assert find_autostart_pids(PROCS, self_pid=100) == [400]
+
+
+def test_find_autostart_pids_matches_relative_launch_path():
+    """从项目根交互式拉起时 cmdline 是相对路径 'cmd /c tools\\autostart-run.bat'
+    （2026-10-21 19:39 真机形态）：不含项目目录名，旧匹配器漏判，桥一旦死掉
+    探活会误走 relaunch 拉第二个 bat → 双桥抢同一会话。相对形态靠第 4 元素
+    cwd 归属项目根来识别（scan_procs 用 psutil 填 cwd）。"""
+    procs = [
+        (100, "pythonw.exe", r"C:\Python\pythonw.exe tools\bridge_probe.py"),
+        (700, "cmd.exe", r"C:\Windows\system32\cmd.exe /c tools\autostart-run.bat",
+         r"E:\1workspace\wechat-claude-bridge"),
+        (500, "cmd.exe", r"cmd /c unrelated.bat", r"E:\1workspace"),
+    ]
+    assert find_autostart_pids(procs, self_pid=100) == [700]
+
+
+def test_find_autostart_pids_ignores_sibling_project_same_bat_name():
+    """claude-remote-web 也有同名 tools\\autostart-run.bat（常驻服务，
+    2026-10-21 真机并存）：只按基名会把它认成桥守护，桥真死时永远 wait_bat
+    不恢复。绝对路径看路径、相对路径看 cwd，两种形态都必须排除姊妹项目。"""
+    procs = [
+        (100, "pythonw.exe", r"pythonw.exe tools\bridge_probe.py"),
+        (701, "cmd.exe",
+         r"cmd /c E:\1workspace\claude-remote-web\tools\autostart-run.bat"),
+        (702, "cmd.exe", r"cmd /c tools\autostart-run.bat",
+         r"E:\1workspace\claude-remote-web"),
+    ]
+    assert find_autostart_pids(procs, self_pid=100) == []
+
+
+def test_find_autostart_pids_matches_quoted_absolute_run_bat():
+    procs = [
+        (100, "pythonw.exe", r"pythonw.exe tools\bridge_probe.py"),
+        (800, "cmd.exe",
+         r'cmd /c "E:\1workspace\wechat-claude-bridge\tools\autostart-run.bat"'),
+    ]
+    assert find_autostart_pids(procs, self_pid=100) == [800]

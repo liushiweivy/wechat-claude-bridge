@@ -53,6 +53,14 @@ def test_notify_prefix_is_ignored():
     assert ins.kind == "ignore"
 
 
+def test_media_placeholders_are_ignored():
+    # wxauto 把图片/文件报成占位文本，拿不到本体，派任务只会空转
+    assert parse_instruction("[图片]").kind == "ignore"
+    assert parse_instruction("[文件] 报表.xlsx").kind == "ignore"
+    # 含占位字样但不是纯占位开头的正常文本仍是任务
+    assert parse_instruction("帮我找带[图片]的页面").kind == "task"
+
+
 def test_unknown_command_and_blank():
     ins = parse_instruction("/frobnicate x")
     assert ins.kind == "unknown"

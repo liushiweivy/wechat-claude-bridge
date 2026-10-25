@@ -29,6 +29,10 @@ COMMANDS = {"help", "new", "cd", "sudo", "cancel", "status", "open", "win"}
 # 桥直接忽略，不回复、不派任务。发送方见 claude-remote-web/tools/notify_public_url.py。
 NOTIFY_PREFIXES = ("🌐",)
 
+# 多媒体占位消息：wxauto 拿不到图片/文件本体，只报 "[图片]"、"[文件] xxx" 占位
+# 文本。派任务只会让 Claude 对着占位符空转（2026-10-25 用户要求直接忽略）。
+MEDIA_PLACEHOLDER_PREFIXES = ("[图片]", "[文件]")
+
 
 @dataclass
 class Instruction:
@@ -43,6 +47,8 @@ def parse_instruction(raw: str) -> Instruction:
     if not text:
         return Instruction("unknown")
     if text.startswith(NOTIFY_PREFIXES):
+        return Instruction("ignore")
+    if text.startswith(MEDIA_PLACEHOLDER_PREFIXES):
         return Instruction("ignore")
     if not text.startswith("/"):
         return Instruction("task", text=text)
